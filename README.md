@@ -1,65 +1,140 @@
-# SmartDrop contracts
+# StellarPOS Contracts
 
-[![CI](https://github.com/SmartDropLabs/smartdrop-contracts/actions/workflows/ci.yml/badge.svg)](https://github.com/SmartDropLabs/smartdrop-contracts/actions/workflows/ci.yml)
+Soroban smart contracts for StellarPOS, a point-of-sale system for merchants
+who accept payment on the Stellar network.
 
-**Soroban (Rust)** smart contracts and design notes for [**SmartDrop**](https://github.com/SmartDropLabs/SmartDrop) on **Stellar**.
+[![CI](https://github.com/StellarPOS-App/contracts/actions/workflows/ci.yml/badge.svg)](https://github.com/StellarPOS-App/contracts/actions/workflows/ci.yml)
+![soroban-sdk](https://img.shields.io/badge/soroban--sdk-27.0.6-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-## Related repositories
+This repository is one of three:
 
-| Repository | Role |
-|------------|------|
-| [**smart-frontend**](https://github.com/SmartDropLabs/smart-frontend) | Next.js app (Freighter, RPC) |
-| [**smartdrop-backend**](https://github.com/SmartDropLabs/smartdrop-backend) | APIs and indexing (planned) |
-| [**SmartDrop**](https://github.com/SmartDropLabs/SmartDrop) | Original monorepo (reference) |
+| Repository | What it is |
+|---|---|
+| [`contracts`](https://github.com/StellarPOS-App/contracts) (this repo) | On-chain settlement, loyalty, treasury and escrow |
+| [`backend`](https://github.com/StellarPOS-App/backend) | REST + WebSocket API: catalog, sales, checkout, payment matching |
+| [`surface`](https://github.com/StellarPOS-App/surface) | The point-of-sale web app cashiers and managers use |
 
-## Layout
+## The contracts
 
-- [`contracts/`](./contracts/README.md) — reserved layout / pointers  
-- [`soroban/`](./soroban/README.md) — Soroban design and future Rust workspace
+| Crate | Purpose | Key entry points |
+|---|---|---|
+| [`merchant-registry`](contracts/merchant-registry/src/lib.rs) | Who may get paid, where funds settle, which assets each merchant takes | `register`, `approve`, `suspend`, `accepts`, `settlement_of` |
+| [`payment-processor`](contracts/payment-processor/src/lib.rs) | Atomic sale settlement: fee to treasury, net to merchant, one payment per order | `pay`, `pay_batch`, `refund`, `payment_for_order`, `quote` |
+| [`loyalty-program`](contracts/loyalty-program/src/lib.rs) | Per-merchant points with automatic Bronze/Silver/Gold/Platinum tiers | `enroll`, `accrue`, `redeem`, `get_account` |
+| [`treasury`](contracts/treasury/src/lib.rs) | M-of-N multisig that holds protocol fees and can put idle funds into approved yield vaults | `propose`, `approve`, `execute`, `freeze`, `vaults` |
+| [`escrow-service`](contracts/escrow-service/src/lib.rs) | Held payments for deliveries and pre-orders, with dispute resolution | `create`, `release`, `claim`, `raise_dispute`, `resolve`, `resolve_by_default` |
+| [`payment-stream`](contracts/payment-stream/src/lib.rs) | Per-second payment streams for subscriptions, rent and payroll; cancel splits earned and unearned exactly | `create`, `withdraw`, `cancel`, `available` |
+| [`shared`](contracts/shared/src/lib.rs) | Library, not deployed: basis-point fee math and storage TTL helpers | `bps_of`, `split_fee`, `extend_*` |
 
-Contract sources live under [`soroban/`](./soroban/README.md). After deployment, publish the factory contract ID and RPC URL to the frontend repo’s environment variables.
+### How a sale settles
 
-## Quick Start (deployment)
+```mermaid
+sequenceDiagram
+    participant C as Customer wallet
+    participant P as payment-processor
+    participant R as merchant-registry
+    participant T as Token (SAC)
+    participant L as loyalty-program
+    C->>P: pay(payer, merchant, asset, amount, order_ref)
+    P->>R: accepts(merchant, asset)?
+    R-->>P: true
+    P->>R: settlement_of(merchant)
+    P->>T: transfer(payer -> settlement, net)
+    P->>T: transfer(payer -> treasury, fee)
+    P->>L: accrue(processor, merchant, payer, amount)
+    P-->>C: payment id (event: payment_settled)
+```
+
+All transfers happen inside one transaction, so either the whole sale settles
+or nothing moves. The processor never holds customer funds, and the
+`(merchant, order_ref)` pair is unique, so a retried checkout cannot charge
+twice.
+
+### Design rules
+
+These hold across every contract:
+
+- **Typed errors, no panics on user input.** Each contract has a
+  `#[contracterror]` enum. Clients get a stable numeric code for every
+  rejection.
+- **Events for every state change**, defined with `#[contractevent]`, so the
+  backend and indexers can follow everything without polling storage.
+- **Emergency pause.** Registry, processor, loyalty and escrow can be paused
+  by their admin. Escrow refunds still work while paused, because returning
+  funds to a buyer is always safe. The treasury uses a multisig freeze
+  instead.
+- **Checked arithmetic.** Fee and split math goes through `shared::bps_of`,
+  which returns `None` on overflow or on more than 100%.
+- **TTL management.** Every read or write of a long-lived record extends its
+  TTL, so active data is never archived.
+
+More detail on each contract, including state machines and storage layout, is
+in [docs/architecture.md](docs/architecture.md).
+
+## Getting started
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) with the `wasm32-unknown-unknown` target
-- [Stellar CLI](https://developers.stellar.org/docs/tools/developer-tools) (`stellar`)
-- A funded Stellar identity on the target network (testnet or mainnet)
+- Rust stable with the `wasm32v1-none` target (pinned in
+  [`rust-toolchain.toml`](rust-toolchain.toml), installed automatically by
+  rustup)
+- [Stellar CLI](https://developers.stellar.org/docs/tools/cli) 23 or newer,
+  for building optimized wasm and deploying
+
+### Build and test
 
 ```bash
-rustup target add wasm32-unknown-unknown
-stellar keys generate default --network testnet   # if you do not already have an identity
+git clone https://github.com/StellarPOS-App/contracts.git
+cd contracts
+
+make test      # 63 tests across all crates
+make check     # rustfmt + clippy -D warnings + tests (what CI runs)
+make build     # optimized wasm in target/wasm32v1-none/release/
+make sizes     # wasm sizes, all well under the 64 KB limit
+make verify    # check a deployment runs exactly this source (NETWORK=testnet)
 ```
 
-Fund testnet accounts via [Friendbot](https://friendbot.stellar.org/?addr=YOUR_ADDRESS).
-
-Network RPC URLs and passphrases are defined in [`stellar.toml`](./stellar.toml). The deploy script registers the selected network with the CLI automatically.
-
-### Build, test, and deploy
+### Deploy to testnet
 
 ```bash
-make build            # compile release WASM to soroban/target/wasm32-unknown-unknown/release/
-make test             # run contract unit tests
-
-make deploy-testnet   # install pool WASM, deploy factory, initialize, write .contract-ids.json
-make deploy-mainnet   # same flow on mainnet (requires a funded mainnet identity)
+make deploy                      # NETWORK=testnet, FEE_BPS=100 by default
+NETWORK=testnet FEE_BPS=250 make deploy
 ```
 
-`scripts/deploy.sh` accepts optional environment variables:
+[`scripts/deploy.sh`](scripts/deploy.sh) creates and funds a deployer
+identity if needed, deploys all five contracts, initializes them, connects
+the loyalty program to the processor, and writes every contract ID to
+`deployments/<network>.json`. See [docs/deployment.md](docs/deployment.md)
+for the post-deploy checklist (multisig rotation, merchant onboarding) and
+example `stellar contract invoke` calls.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `NETWORK` | `testnet` | `testnet` or `mainnet` |
-| `SOURCE` | `default` | Stellar CLI identity used to sign transactions |
-| `ADMIN` | address of `SOURCE` | Factory admin passed to `initialize` |
-| `STELLAR_TOML` | `./stellar.toml` | Network configuration file |
-| `CONTRACT_IDS_FILE` | `./.contract-ids.json` | Output path for deployed IDs |
+## Project layout
 
-Example with a custom identity:
-
-```bash
-SOURCE=alice ADMIN=G... make deploy-testnet
+```
+contracts/
+  shared/               fee math and TTL helpers (rlib)
+  merchant-registry/
+  payment-processor/
+  loyalty-program/
+  treasury/
+  escrow-service/
+    src/dispute.rs      dispute reasons, role rules, default rulings
+    tests/              end-to-end dispute scenarios
+docs/                   architecture and deployment guides
+scripts/deploy.sh       deploy + initialize + wire
+deployments/            contract IDs per network (written by deploy.sh)
 ```
 
-On success, `.contract-ids.json` contains the factory contract ID and installed pool WASM hash (gitignored).
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md). In short: open an issue first for
+anything non-trivial, keep pull requests focused, and run `make check`
+before pushing. Security issues go through [SECURITY.md](SECURITY.md), never
+public issues.
+
+## License
+
+[MIT](LICENSE)
+
+## On-Chain Terminal Registration\n\nPOS terminals should be registered on-chain so the backend can verify a payment was initiated from an authorized device, preventing a compromised backend from injecting fraudulent payment requests.
